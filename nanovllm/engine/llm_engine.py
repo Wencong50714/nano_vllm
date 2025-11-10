@@ -2,7 +2,7 @@ import atexit
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoProcessor
 import torch.multiprocessing as mp
 
 from nanovllm.config import Config
@@ -29,6 +29,7 @@ class LLMEngine:
             self.events.append(event)
         self.model_runner = ModelRunner(config, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
+        self.processor = AutoProcessor.from_pretrained(config.model)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
@@ -39,10 +40,20 @@ class LLMEngine:
         for p in self.ps:
             p.join()
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
-        if isinstance(prompt, str):
-            prompt = self.tokenizer.encode(prompt)
-        seq = Sequence(prompt, sampling_params)
+    def add_request(
+        self,
+        prompt: str | list[int] | dict,
+        sampling_params: SamplingParams,
+    ) -> None:
+        
+        if isinstance(prompt, dict) and "video_data" in prompt:
+            text_prompt = self.tokenizer.encode(prompt["prompt"])
+            seq = Sequence(text_prompt, sampling_params=sampling_params, mm_data=prompt["video_data"])
+        else:
+            if isinstance(prompt, str):
+                prompt = self.tokenizer.encode(prompt)
+            seq = Sequence(prompt, sampling_params)
+        
         self.scheduler.add(seq)
 
     def step(self):

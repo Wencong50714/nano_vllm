@@ -26,7 +26,6 @@ class LinearBase(nn.Module):
         self.weight.weight_loader = self.weight_loader
         if bias:
             self.bias = nn.Parameter(torch.empty(output_size))
-            self.bias.weight_loader = self.weight_loader
         else:
             self.register_parameter("bias", None)
 
@@ -61,6 +60,10 @@ class ColumnParallelLinear(LinearBase):
     ):
         tp_size = dist.get_world_size()
         super().__init__(input_size, divide(output_size, tp_size), bias, 0)
+        
+        if bias:
+            self.bias.weight_loader = self.weight_loader
+            
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
@@ -103,6 +106,9 @@ class QKVParallelLinear(ColumnParallelLinear):
         total_num_kv_heads: int | None = None,
         bias: bool = False,
     ):
+        self.total_num_heads = total_num_heads
+        self.total_num_kv_heads = total_num_kv_heads
+        
         tp_size = dist.get_world_size()
         total_num_kv_heads = total_num_kv_heads or total_num_heads
         self.head_size = head_size
@@ -111,21 +117,49 @@ class QKVParallelLinear(ColumnParallelLinear):
         output_size = (total_num_heads + 2 * total_num_kv_heads) * self.head_size
         super().__init__(hidden_size, output_size, bias)
 
-    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str):
-        param_data = param.data
-        assert loaded_shard_id in ["q", "k", "v"]
-        if loaded_shard_id == "q":
-            shard_size = self.num_heads * self.head_size
-            shard_offset = 0
-        elif loaded_shard_id == "k":
-            shard_size = self.num_kv_heads * self.head_size
-            shard_offset = self.num_heads * self.head_size
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str = None):
+        if loaded_shard_id is None:
+            tp_dim = 0
+            
+            total_q_size = self.total_num_heads * self.head_size
+            total_k_size = self.total_num_kv_heads * self.head_size
+            total_v_size = self.total_num_kv_heads * self.head_size
+
+            q_loaded = loaded_weight.narrow(tp_dim, 0, total_q_size)
+            k_loaded = loaded_weight.narrow(tp_dim, total_q_size, total_k_size)
+            v_loaded = loaded_weight.narrow(tp_dim, total_q_size + total_k_size, total_v_size)
+            
+            q_shard = q_loaded.chunk(self.tp_size, tp_dim)[self.tp_rank]
+            k_shard = k_loaded.chunk(self.tp_size, tp_dim)[self.tp_rank]
+            v_shard = v_loaded.chunk(self.tp_size, tp_dim)[self.tp_rank]
+            
+            local_q_size = self.num_heads * self.head_size
+            local_k_size = self.num_kv_heads * self.head_size
+            local_v_size = self.num_kv_heads * self.head_size
+            
+            param_data = param.data
+            q_param = param_data.narrow(tp_dim, 0, local_q_size)
+            k_param = param_data.narrow(tp_dim, local_q_size, local_k_size)
+            v_param = param_data.narrow(tp_dim, local_q_size + local_k_size, local_v_size)
+            
+            q_param.copy_(q_shard)
+            k_param.copy_(k_shard)
+            v_param.copy_(v_shard)
         else:
-            shard_size = self.num_kv_heads * self.head_size
-            shard_offset = self.num_heads * self.head_size + self.num_kv_heads * self.head_size
-        param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
-        loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
-        param_data.copy_(loaded_weight)
+            param_data = param.data
+            assert loaded_shard_id in ["q", "k", "v"]
+            if loaded_shard_id == "q":
+                shard_size = self.num_heads * self.head_size
+                shard_offset = 0
+            elif loaded_shard_id == "k":
+                shard_size = self.num_kv_heads * self.head_size
+                shard_offset = self.num_heads * self.head_size
+            else:
+                shard_size = self.num_kv_heads * self.head_size
+                shard_offset = self.num_heads * self.head_size + self.num_kv_heads * self.head_size
+            param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
+            loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
+            param_data.copy_(loaded_weight)
 
 
 class RowParallelLinear(LinearBase):
@@ -138,6 +172,9 @@ class RowParallelLinear(LinearBase):
     ):
         tp_size = dist.get_world_size()
         super().__init__(divide(input_size, tp_size), output_size, bias, 1)
+        
+        if bias:
+            self.bias.weight_loader = self.bias_loader
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
@@ -145,6 +182,9 @@ class RowParallelLinear(LinearBase):
         start_idx = self.tp_rank * shard_size
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         param_data.copy_(loaded_weight)
+        
+    def bias_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)

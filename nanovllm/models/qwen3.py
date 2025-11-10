@@ -1,4 +1,6 @@
 from collections.abc import Iterable, Callable
+from unicodedata import name
+from typing import Optional
 
 import torch
 from torch import nn
@@ -174,8 +176,9 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
+        hidden_states = self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
@@ -226,7 +229,9 @@ class Qwen3ForCausalLM(nn.Module):
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
         default_weight_loader: Callable[[nn.Parameter, torch.Tensor], None],
-    ) -> None:
+    ) -> set[str]:
+        loaded_params: set[str] = set()
+        
         for weight_name, loaded_weight in weights:
             for k in self.packed_modules_mapping:
                 if k in weight_name:
@@ -241,3 +246,5 @@ class Qwen3ForCausalLM(nn.Module):
                 param = self.get_parameter(weight_name)
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+        return loaded_params
