@@ -1,3 +1,5 @@
+from collections.abc import Iterable, Callable
+
 import torch
 from torch import nn
 import torch.distributed as dist
@@ -9,7 +11,7 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
-
+from nanovllm.models.registry import register_model
 
 class Qwen3Attention(nn.Module):
 
@@ -157,7 +159,6 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
-
 class Qwen3Model(nn.Module):
 
     def __init__(
@@ -182,6 +183,7 @@ class Qwen3Model(nn.Module):
         return hidden_states
 
 
+@register_model("qwen2")
 class Qwen3ForCausalLM(nn.Module):
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
@@ -213,3 +215,29 @@ class Qwen3ForCausalLM(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         return self.lm_head(hidden_states)
+    
+    def get_input_embeddings(
+        self,
+        input_ids: torch.Tensor
+    ) -> torch.Tensor:
+        return self.model.embed_tokens(input_ids)
+    
+    def load_weights(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+        default_weight_loader: Callable[[nn.Parameter, torch.Tensor], None],
+    ) -> None:
+        for weight_name, loaded_weight in weights:
+            for k in self.packed_modules_mapping:
+                if k in weight_name:
+                    v, shard_id = self.packed_modules_mapping[k]
+                    param_name = weight_name.replace(k, v)
+                    param = self.get_parameter(param_name)
+                    weight_loader = getattr(param, "weight_loader")
+                    weight_loader(param, loaded_weight, shard_id)
+                    break
+            
+            else:
+                param = self.get_parameter(weight_name)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
