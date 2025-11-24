@@ -1,4 +1,4 @@
-This repo is forked from [Nano vLLM](https://github.com/GeeeekExplorer/nano-vllm)
+This repo is forked from [Nano vLLM](https://github.com/GeeeekExplorer/nano-vllm). In the `multi-modal` branch, I add the multi-modal model serving support and test in `Qwen2.5-VL-7B-Instruct` model in both video and image.
 
 ## Quick Start
 
@@ -32,8 +32,8 @@ python -m example
 
 - [x] Add Qwen2.5-vl Model suport
 - [x] Add new feature to support VLM serving
-- [ ] Add video support
-- [ ] Test on multi images and vidoes
+- [x] Add video support
+- [ ] Add benchmark code for multi-modal model
 - [ ] Implement E-P-D disaggregation
 
 

@@ -22,9 +22,13 @@ dependencies = [
 
 [project.optional-dependencies]
 multi-modal = [
+    # For image processing
     "pillow",
     "torchvision",
     "qwen-vl-utils",
+
+    # For video processing
+    "decord",
 ]
 
 all = [

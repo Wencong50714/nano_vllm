@@ -6,10 +6,10 @@ from transformers import AutoConfig
 @dataclass
 class Config:
     model: str
-    max_num_batched_tokens: int = 16384
+    max_num_batched_tokens: int = 65536
     max_num_seqs: int = 512
     max_model_len: int = 4096
-    gpu_memory_utilization: float = 0.9
+    gpu_memory_utilization: float = 0.7
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
     hf_config: AutoConfig | None = None

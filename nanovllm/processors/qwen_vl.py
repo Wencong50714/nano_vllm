@@ -227,8 +227,6 @@ class Qwen2_5VLMultiModalProcessor(BaseMultimodalProcessor):
                 r"<\|vision_start\|>(?:<\|video_pad\|>)+<\|vision_end\|>"
             ),
         ).build(_processor)
-        
-        self.process = self.process_mm_data_sync
 
     def process_mm_data_sync(
         self, 

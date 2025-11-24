@@ -44,7 +44,7 @@ class LLMEngine:
         for p in self.ps:
             p.join()
 
-    def add_request(
+    async def add_request(
         self,
         prompt: str | list[int] | dict,
         sampling_params: SamplingParams,
@@ -61,7 +61,7 @@ class LLMEngine:
                 video_data = [video_data]
 
         if image_data is not None or video_data is not None:
-            mm_inputs = self.mm_data_processor.process(
+            mm_inputs = await self.mm_data_processor.process_mm_data_async(
                 image_data=image_data,
                 video_data=video_data,
                 input_text=prompt,
@@ -85,7 +85,7 @@ class LLMEngine:
     def is_finished(self):
         return self.scheduler.is_finished()
 
-    def generate(
+    async def generate(
         self,
         prompts: list[str] | list[list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
@@ -98,7 +98,7 @@ class LLMEngine:
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
         for prompt, sp in zip(prompts, sampling_params):
-            self.add_request(prompt, sp, image_data=image_data, video_data=video_data)
+            await self.add_request(prompt, sp, image_data=image_data, video_data=video_data)
         outputs = {}
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
