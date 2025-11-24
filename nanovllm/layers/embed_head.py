@@ -50,8 +50,12 @@ class ParallelLMHead(VocabParallelEmbedding):
         embedding_dim: int,
         bias: bool = False,
     ):
-        assert not bias
         super().__init__(num_embeddings, embedding_dim)
+        if bias:
+            self.bias = nn.Parameter(torch.empty(self.num_embeddings_per_partition))
+            self.bias.weight_loader = self.weight_loader
+        else:
+            self.register_parameter("bias", None)
 
     def forward(self, x: torch.Tensor):
         context = get_context()

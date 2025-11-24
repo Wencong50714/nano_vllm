@@ -10,6 +10,8 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.processors.qwen_vl import Qwen2_5VLMultiModalProcessor
+from nanovllm.engine.mm_io_struct import MultimodalInputs
 
 
 class LLMEngine:
@@ -28,8 +30,10 @@ class LLMEngine:
             self.ps.append(process)
             self.events.append(event)
         self.model_runner = ModelRunner(config, 0, self.events)
+        
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         self.processor = AutoProcessor.from_pretrained(config.model)
+        self.mm_data_processor = Qwen2_5VLMultiModalProcessor(config.hf_config, config, self.processor, transport_mode="default")
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
@@ -44,16 +48,30 @@ class LLMEngine:
         self,
         prompt: str | list[int] | dict,
         sampling_params: SamplingParams,
+        image_data=None,
+        video_data=None,
     ) -> None:
+        if isinstance(prompt, str):
+            token_ids = self.tokenizer.encode(prompt)
+        if image_data is not None:
+            if not isinstance(image_data, list):
+                image_data = [image_data]
+        if video_data is not None:
+            if not isinstance(video_data, list):
+                video_data = [video_data]
+
+        if image_data is not None or video_data is not None:
+            mm_inputs = self.mm_data_processor.process(
+                image_data=image_data,
+                video_data=video_data,
+                input_text=prompt,
+            )
+            token_ids = mm_inputs["input_ids"]
         
-        if isinstance(prompt, dict) and "video_data" in prompt:
-            text_prompt = self.tokenizer.encode(prompt["prompt"])
-            seq = Sequence(text_prompt, sampling_params=sampling_params, mm_data=prompt["video_data"])
-        else:
-            if isinstance(prompt, str):
-                prompt = self.tokenizer.encode(prompt)
-            seq = Sequence(prompt, sampling_params)
-        
+        mm_inputs = MultimodalInputs.from_dict(mm_inputs) if mm_inputs is not None else None
+
+        origin_input_ids = self.model_runner.model.pad_input_ids(token_ids, mm_inputs)
+        seq = Sequence(origin_input_ids, sampling_params, mm_inputs=mm_inputs)
         self.scheduler.add(seq)
 
     def step(self):
@@ -72,13 +90,15 @@ class LLMEngine:
         prompts: list[str] | list[list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
+        image_data=None,
+        video_data=None,
     ) -> list[str]:
         if use_tqdm:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
         for prompt, sp in zip(prompts, sampling_params):
-            self.add_request(prompt, sp)
+            self.add_request(prompt, sp, image_data=image_data, video_data=video_data)
         outputs = {}
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():

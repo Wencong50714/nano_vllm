@@ -7,7 +7,7 @@ This repo is forked from [Nano vLLM](https://github.com/GeeeekExplorer/nano-vllm
 uv venv .venv
 source .venv/bin/activate
 
-uv pip install torch
+uv pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128p
 uv pip install -e .[all]
 ```
 
@@ -28,15 +28,14 @@ python -m example
 | -       | -           | -        | -                    |
 | Original| 133,966     | 9.11 s   | 14705.28           |    
 
-## Roadmap
+## Roadmap for multi-modal support
 
-- [] Add Qwen2.5-vl Model suport
-- [] Add new feature to support VLM serving
-- [] Implement E-P-D disaggregation
+- [x] Add Qwen2.5-vl Model suport
+- [x] Add new feature to support VLM serving
+- [ ] Add video support
+- [ ] Test on multi images and vidoes
+- [ ] Implement E-P-D disaggregation
 
-Cur details
-- [] Model weight loadder
-- [] Qwen3 config initialization inside engine
 
 
 # Design Doc

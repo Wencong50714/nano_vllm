@@ -5,7 +5,7 @@ from typing import Optional
 import torch
 from torch import nn
 import torch.distributed as dist
-from transformers import Qwen3Config
+from transformers import Qwen2Config
 
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
@@ -15,7 +15,7 @@ from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.models.registry import register_model
 
-class Qwen3Attention(nn.Module):
+class Qwen2Attention(nn.Module):
 
     def __init__(
         self,
@@ -91,7 +91,7 @@ class Qwen3Attention(nn.Module):
         return output
 
 
-class Qwen3MLP(nn.Module):
+class Qwen2MLP(nn.Module):
 
     def __init__(
         self,
@@ -120,14 +120,14 @@ class Qwen3MLP(nn.Module):
         return x
 
 
-class Qwen3DecoderLayer(nn.Module):
+class Qwen2DecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3Config,
+        config: Qwen2Config,
     ) -> None:
         super().__init__()
-        self.self_attn = Qwen3Attention(
+        self.self_attn = Qwen2Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -138,7 +138,7 @@ class Qwen3DecoderLayer(nn.Module):
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
         )
-        self.mlp = Qwen3MLP(
+        self.mlp = Qwen2MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
@@ -161,15 +161,15 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
-class Qwen3Model(nn.Module):
+class Qwen2Model(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3Config,
+        config: Qwen2Config,
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([Qwen2DecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -184,10 +184,13 @@ class Qwen3Model(nn.Module):
             hidden_states, residual = layer(positions, hidden_states, residual)
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
+    
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embed_tokens
 
 
-@register_model("qwen3")
-class Qwen3ForCausalLM(nn.Module):
+@register_model("qwen2")
+class Qwe2ForCausalLM(nn.Module):
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -198,10 +201,10 @@ class Qwen3ForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3Config
+        config: Qwen2Config
     ) -> None:
         super().__init__()
-        self.model = Qwen3Model(config)
+        self.model = Qwen2Model(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data

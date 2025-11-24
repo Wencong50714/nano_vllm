@@ -1,10 +1,16 @@
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, Union
+from typing_extensions import TypeAlias
+
 import torch
 
-from typing_extensions import TypeAlias
-from typing import Union
+
+def permute_inv(perm: torch.Tensor) -> torch.Tensor:
+    inv_perm = torch.empty_like(perm)
+    inv_perm[perm] = torch.arange(perm.numel(), device=perm.device, dtype=perm.dtype)
+    return inv_perm
+
 
 NestedTensors: TypeAlias = Union[list["NestedTensors"], list["torch.Tensor"],
                                  "torch.Tensor", tuple["torch.Tensor", ...]]

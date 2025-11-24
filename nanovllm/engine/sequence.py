@@ -5,6 +5,7 @@ from itertools import count
 import torch
 
 from nanovllm.sampling_params import SamplingParams
+from nanovllm.engine.mm_io_struct import MultimodalInputs
 
 
 class SequenceStatus(Enum):
@@ -21,7 +22,7 @@ class Sequence:
         self,
         token_ids:list[int],
         sampling_params = SamplingParams(),
-        mm_data: dict | None = None,
+        mm_inputs: MultimodalInputs = None,
     ):
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
@@ -34,13 +35,19 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
-        self.mm_data = mm_data
+        self.mm_inputs = mm_inputs
 
     def __len__(self):
         return self.num_tokens
 
     def __getitem__(self, key):
         return self.token_ids[key]
+    
+    def extend_image_inputs(self, mm_inputs: MultimodalInputs):
+        if self.mm_inputs is None:
+            self.mm_inputs = mm_inputs
+        else:
+            self.mm_inputs.merge(mm_inputs)
 
     @property
     def is_finished(self):

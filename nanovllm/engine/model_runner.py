@@ -1,4 +1,5 @@
 import pickle
+from nanovllm.engine.mm_io_struct import MultimodalInputs
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -6,9 +7,9 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.mm_utils import init_embedding_cache
 from nanovllm.layers.sampler import Sampler
-from nanovllm.utils.context import set_context, get_context, reset_context
+from nanovllm.utils.context import set_context, get_context, reset_context, set_context_field
 from nanovllm.utils.loader import load_model
 from nanovllm.models.registry import get_model_class
 
@@ -26,6 +27,7 @@ class ModelRunner:
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
+        self.device = torch.device("cuda", rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
@@ -36,8 +38,10 @@ class ModelRunner:
         load_model(self.model, config.model)
 
         self.sampler = Sampler()
-        self.warmup_model()
+        # self.warmup_model()
         self.allocate_kv_cache()
+        init_embedding_cache(getattr(self.config, "embedding_cache_size", 100) * 1024 * 1024)
+        
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -128,23 +132,127 @@ class ModelRunner:
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
+    def _expand_mrope_from_input(
+        self,
+        mm_input: MultimodalInputs,
+        seq_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if mm_input.mrope_position_delta.device.type != device:
+            # transfer mrope_position_delta to device when the first running,
+            # avoiding successvie host-to-device data transfer
+            mm_input.mrope_position_delta = mm_input.mrope_position_delta.to(
+                device, non_blocking=True
+            )
+
+        mrope_position_deltas = mm_input.mrope_position_delta.flatten()
+        mrope_positions = (
+            (mrope_position_deltas + seq_len - 1).unsqueeze(0).repeat(3, 1)
+        )
+        return mrope_positions
+
+    def _compute_mrope_positions_prefill(self, mm_inputs: list[MultimodalInputs], seq_lens, extend_seq_lens, extend_prefix_lens):
+        # batch_size * [3 * seq_len]
+        batch_size = seq_lens.shape[0]
+        mrope_positions_list = [[]] * batch_size
+        for batch_idx in range(batch_size):
+            mm_input = mm_inputs[batch_idx]
+            
+            extend_seq_len, extend_prefix_len = (
+                extend_seq_lens[batch_idx],
+                extend_prefix_lens[batch_idx],
+            )
+            if mm_input is None:
+                # text only
+                mrope_positions = torch.tensor(
+                    [
+                        [
+                            pos
+                            for pos in range(
+                                extend_prefix_len,
+                                extend_prefix_len + extend_seq_len,
+                            )
+                        ]
+                    ]
+                    * 3
+                )
+            else:
+                mrope_positions = mm_input.mrope_positions[
+                    :,
+                    extend_prefix_len : extend_prefix_len + extend_seq_len,
+                ]
+                if mrope_positions.numel() == 0:
+                    mrope_positions = self._expand_mrope_from_input(
+                        mm_input, seq_lens[batch_idx], self.device
+                    )
+            mrope_positions_list[batch_idx] = mrope_positions
+
+        mrope_positions = torch.cat(
+            [pos.to(device=self.device) for pos in mrope_positions_list],
+            dim=1,
+        ).to(dtype=torch.int64, device=self.device)
+        
+        return mrope_positions
+
+    def _compute_mrope_positions_decode(self, mm_inputs: list[MultimodalInputs], seq_lens):
+        # batch_size * [3 * seq_len]
+        batch_size = seq_lens.shape[0]
+        mrope_positions_list = [[]] * batch_size
+        for batch_idx in range(batch_size):
+            mm_input = mm_inputs[batch_idx]
+            # 3 * N
+            if mm_input is None:
+                mrope_positions_list[batch_idx] = torch.full(
+                    (3, 1),
+                    seq_lens[batch_idx] - 1,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+            else:
+                mrope_positions = self._expand_mrope_from_input(
+                    mm_input, seq_lens[batch_idx], self.device
+                )
+                mrope_positions_list[batch_idx] = mrope_positions
+
+        mrope_positions = torch.cat(
+            [pos.to(device=self.device) for pos in mrope_positions_list],
+            dim=1,
+        ).to(dtype=torch.int64, device=self.device)
+        
+        return mrope_positions
+
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
         cu_seqlens_k = [0]
+        
+        seq_lens = []
+        prefix_lens = []
+        extend_seq_lens = []
+        
         max_seqlen_q = 0
         max_seqlen_k = 0
         slot_mapping = []
         block_tables = None
+        mm_inputs = []
+
         for seq in seqs:
             seqlen = len(seq)
             input_ids.extend(seq[seq.num_cached_tokens:])
             positions.extend(list(range(seq.num_cached_tokens, seqlen)))
+            
             seqlen_q = seqlen - seq.num_cached_tokens
             seqlen_k = seqlen
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
+            
+            # new metadata added here
+            mm_inputs.append(seq.mm_inputs)
+            seq_lens.append(seqlen)
+            prefix_lens.append(seq.num_cached_tokens)
+            extend_seq_lens.append(seqlen_q)
+
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:    # warmup
@@ -156,32 +264,61 @@ class ModelRunner:
                 else:
                     end = start + seq.last_block_num_tokens 
                 slot_mapping.extend(list(range(start, end)))
+        
+        for mm_input in mm_inputs:
+            if mm_input is not None:
+                for mm_item in mm_input.mm_items:
+                    mm_item.feature = getattr(mm_item, "feature", None).to(self.device, non_blocking=True)
+        
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
+        
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        
+        # what to add in context?
+        # prefix_lens, extend_seq_lens, mm_inputs
+        
+        seq_lens = torch.tensor(seq_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        prefix_lens = torch.tensor(prefix_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        extend_seq_lens = torch.tensor(extend_seq_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        mrope_positions = self._compute_mrope_positions_prefill(mm_inputs, seq_lens, extend_seq_lens, prefix_lens)
+
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        
+        set_context_field("mm_inputs", mm_inputs)
+        set_context_field("mrope_positions", mrope_positions)
+        set_context_field("extend_prefix_lens", prefix_lens)
+        set_context_field("extend_seq_lens", extend_seq_lens)
+        set_context_field("seq_lens", seq_lens)
+        
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
         input_ids = []
         positions = []
         slot_mapping = []
-        context_lens = []
+        seq_lens = []
+        mm_inputs = []
         for seq in seqs:
             input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
-            context_lens.append(len(seq))
+            positions.append(len(seq))
+            seq_lens.append(len(seq))
+            mm_inputs.append(seq.mm_inputs)
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+            
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        seq_lens = torch.tensor(seq_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        
+        mrope_positions = self._compute_mrope_positions_decode(mm_inputs, seq_lens)
+        set_context(False, slot_mapping=slot_mapping, context_lens=seq_lens, block_tables=block_tables)
+        set_context_field("mrope_positions", mrope_positions)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):

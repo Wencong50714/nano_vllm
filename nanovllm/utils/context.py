@@ -25,3 +25,11 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
 def reset_context():
     global _CONTEXT
     _CONTEXT = Context()
+
+def set_context_field(field_name, value):
+    global _CONTEXT
+    setattr(_CONTEXT, field_name, value)
+
+def get_context_field(field_name):
+    global _CONTEXT
+    return getattr(_CONTEXT, field_name, None)
