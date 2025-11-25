@@ -97,7 +97,6 @@ def get_rope(
     if rope_scaling is None:
         rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
     elif "mrope_section" in rope_scaling:
-
         rotary_emb = MRotaryEmbedding(
             head_size,
             rotary_dim,

@@ -18,6 +18,8 @@ dependencies = [
     "flash-attn",
     "xxhash",
     "pybase64",
+    # Profiler
+    "py-spy",
 ]
 
 [project.optional-dependencies]

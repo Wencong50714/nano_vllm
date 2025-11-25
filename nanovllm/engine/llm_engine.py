@@ -53,6 +53,9 @@ class LLMEngine:
     ) -> None:
         if isinstance(prompt, str):
             token_ids = self.tokenizer.encode(prompt)
+        elif isinstance(prompt, list):
+            token_ids = prompt 
+            
         if image_data is not None:
             if not isinstance(image_data, list):
                 image_data = [image_data]
@@ -60,6 +63,7 @@ class LLMEngine:
             if not isinstance(video_data, list):
                 video_data = [video_data]
 
+        mm_inputs = None
         if image_data is not None or video_data is not None:
             mm_inputs = await self.mm_data_processor.process_mm_data_async(
                 image_data=image_data,
@@ -68,7 +72,7 @@ class LLMEngine:
             )
             token_ids = mm_inputs["input_ids"]
         
-        mm_inputs = MultimodalInputs.from_dict(mm_inputs) if mm_inputs is not None else None
+            mm_inputs = MultimodalInputs.from_dict(mm_inputs) if mm_inputs is not None else None
 
         origin_input_ids = self.model_runner.model.pad_input_ids(token_ids, mm_inputs)
         seq = Sequence(origin_input_ids, sampling_params, mm_inputs=mm_inputs)
@@ -92,6 +96,7 @@ class LLMEngine:
         use_tqdm: bool = True,
         image_data=None,
         video_data=None,
+        benchmark: bool = False,
     ) -> list[str]:
         if use_tqdm:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
@@ -101,14 +106,25 @@ class LLMEngine:
             await self.add_request(prompt, sp, image_data=image_data, video_data=video_data)
         outputs = {}
         prefill_throughput = decode_throughput = 0.
+        step_start_time = perf_counter()
         while not self.is_finished():
             t = perf_counter()
             output, num_tokens = self.step()
+            step_time = perf_counter() - t
+            
+            # Record timing for benchmark mode
+            if benchmark:
+                current_time = perf_counter()
+                for seq in self.scheduler.waiting + self.scheduler.running:
+                    # Record first token time (after prefill)
+                    if seq.first_token_time is None and seq.num_completion_tokens == 1:
+                        seq.first_token_time = current_time
+            
             if use_tqdm:
                 if num_tokens > 0:
-                    prefill_throughput = num_tokens / (perf_counter() - t)
+                    prefill_throughput = num_tokens / step_time
                 else:
-                    decode_throughput = -num_tokens / (perf_counter() - t)
+                    decode_throughput = -num_tokens / step_time
                 pbar.set_postfix({
                     "Prefill": f"{int(prefill_throughput)}tok/s",
                     "Decode": f"{int(decode_throughput)}tok/s",
@@ -117,8 +133,43 @@ class LLMEngine:
                 outputs[seq_id] = token_ids
                 if use_tqdm:
                     pbar.update(1)
+        
+        # Calculate benchmark metrics
+        benchmark_metrics = None
+        if benchmark:
+            end_time = perf_counter()
+            total_time = end_time - step_start_time
+            
+            # Collect timing data from sequences
+            ttfts = []
+            tpots = []
+            for seq in self.scheduler.finished:
+                if seq.first_token_time is not None:
+                    ttft = seq.first_token_time - step_start_time
+                    ttfts.append(ttft)
+                    
+                    # Calculate TPOT (time per output token after first token)
+                    num_output_tokens = seq.num_completion_tokens
+                    if num_output_tokens > 1:
+                        total_decode_time = end_time - seq.first_token_time
+                        tpot = total_decode_time / (num_output_tokens - 1)
+                        tpots.append(tpot)
+            
+            if ttfts:
+                avg_ttft = sum(ttfts) / len(ttfts)
+                avg_tpot = sum(tpots) / len(tpots) if tpots else 0
+                benchmark_metrics = {
+                    "avg_ttft": avg_ttft,
+                    "avg_tpot": avg_tpot,
+                    "total_time": total_time,
+                    "num_sequences": len(ttfts),
+                }
+        
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         if use_tqdm:
             pbar.close()
+        
+        if benchmark:
+            return outputs, benchmark_metrics
         return outputs

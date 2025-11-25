@@ -37,7 +37,7 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         Replaces multimodal tokens in input_ids with corresponding pad_values from mm_items.
         Each modality (image, audio, video) is handled separately based on its token_id.
         """
-        if not input_ids or not mm_inputs.mm_items:
+        if not input_ids or not mm_inputs or not mm_inputs.mm_items:
             return input_ids
 
         input_ids_tensor = torch.as_tensor(input_ids)

@@ -25,7 +25,7 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        dist.init_process_group("nccl", "tcp://localhost:2334", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         self.device = torch.device("cuda", rank)
         default_dtype = torch.get_default_dtype()
@@ -138,45 +138,45 @@ class ModelRunner:
         seq_len: int,
         device: torch.device,
     ) -> torch.Tensor:
-        if mm_input.mrope_position_delta.device.type != device:
-            # transfer mrope_position_delta to device when the first running,
-            # avoiding successvie host-to-device data transfer
+        if mm_input.mrope_position_delta.device.type != device.type:
             mm_input.mrope_position_delta = mm_input.mrope_position_delta.to(
                 device, non_blocking=True
             )
 
         mrope_position_deltas = mm_input.mrope_position_delta.flatten()
+        # Broadcast delta to (3, seq_len) based on current sequence length
         mrope_positions = (
             (mrope_position_deltas + seq_len - 1).unsqueeze(0).repeat(3, 1)
         )
         return mrope_positions
 
-    def _compute_mrope_positions_prefill(self, mm_inputs: list[MultimodalInputs], seq_lens, extend_seq_lens, extend_prefix_lens):
-        # batch_size * [3 * seq_len]
-        batch_size = seq_lens.shape[0]
-        mrope_positions_list = [[]] * batch_size
+    def _compute_mrope_positions_prefill(
+        self, 
+        mm_inputs: list[MultimodalInputs], 
+        seq_lens: list[int], 
+        extend_seq_lens: list[int], 
+        extend_prefix_lens: list[int]
+    ):
+        # Input args are Python lists (CPU ints), avoiding GPU sync in loop
+        batch_size = len(seq_lens)
+        mrope_positions_list = [None] * batch_size
+        
         for batch_idx in range(batch_size):
             mm_input = mm_inputs[batch_idx]
+            extend_seq_len = extend_seq_lens[batch_idx]
+            extend_prefix_len = extend_prefix_lens[batch_idx]
             
-            extend_seq_len, extend_prefix_len = (
-                extend_seq_lens[batch_idx],
-                extend_prefix_lens[batch_idx],
-            )
             if mm_input is None:
-                # text only
-                mrope_positions = torch.tensor(
-                    [
-                        [
-                            pos
-                            for pos in range(
-                                extend_prefix_len,
-                                extend_prefix_len + extend_seq_len,
-                            )
-                        ]
-                    ]
-                    * 3
+                # Text-only: linear positions [prefix, prefix+len] repeated 3 times
+                positions = torch.arange(
+                    extend_prefix_len,
+                    extend_prefix_len + extend_seq_len,
+                    dtype=torch.int64,
+                    device=self.device
                 )
+                mrope_positions = positions.unsqueeze(0).repeat(3, 1)
             else:
+                # Multimodal: slice pre-computed positions or expand delta
                 mrope_positions = mm_input.mrope_positions[
                     :,
                     extend_prefix_len : extend_prefix_len + extend_seq_len,
@@ -187,39 +187,31 @@ class ModelRunner:
                     )
             mrope_positions_list[batch_idx] = mrope_positions
 
-        mrope_positions = torch.cat(
-            [pos.to(device=self.device) for pos in mrope_positions_list],
-            dim=1,
-        ).to(dtype=torch.int64, device=self.device)
-        
-        return mrope_positions
+        return torch.cat(mrope_positions_list, dim=1).to(dtype=torch.int64, device=self.device)
 
-    def _compute_mrope_positions_decode(self, mm_inputs: list[MultimodalInputs], seq_lens):
-        # batch_size * [3 * seq_len]
-        batch_size = seq_lens.shape[0]
-        mrope_positions_list = [[]] * batch_size
+    def _compute_mrope_positions_decode(self, mm_inputs: list[MultimodalInputs], seq_lens: list[int]):
+        # Input args are Python lists
+        batch_size = len(seq_lens)
+        mrope_positions_list = [None] * batch_size
+        
         for batch_idx in range(batch_size):
             mm_input = mm_inputs[batch_idx]
-            # 3 * N
+            current_seq_len = seq_lens[batch_idx]
+            
             if mm_input is None:
+                # Text-only: position is simply seq_len - 1
                 mrope_positions_list[batch_idx] = torch.full(
                     (3, 1),
-                    seq_lens[batch_idx] - 1,
+                    current_seq_len - 1,
                     dtype=torch.int64,
                     device=self.device,
                 )
             else:
-                mrope_positions = self._expand_mrope_from_input(
-                    mm_input, seq_lens[batch_idx], self.device
+                mrope_positions_list[batch_idx] = self._expand_mrope_from_input(
+                    mm_input, current_seq_len, self.device
                 )
-                mrope_positions_list[batch_idx] = mrope_positions
 
-        mrope_positions = torch.cat(
-            [pos.to(device=self.device) for pos in mrope_positions_list],
-            dim=1,
-        ).to(dtype=torch.int64, device=self.device)
-        
-        return mrope_positions
+        return torch.cat(mrope_positions_list, dim=1).to(dtype=torch.int64, device=self.device)
 
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
@@ -227,6 +219,7 @@ class ModelRunner:
         cu_seqlens_q = [0]
         cu_seqlens_k = [0]
         
+        # Python lists for CPU-side processing
         seq_lens = []
         prefix_lens = []
         extend_seq_lens = []
@@ -247,7 +240,7 @@ class ModelRunner:
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             
-            # new metadata added here
+            # Collect metadata
             mm_inputs.append(seq.mm_inputs)
             seq_lens.append(seqlen)
             prefix_lens.append(seq.num_cached_tokens)
@@ -255,14 +248,12 @@ class ModelRunner:
 
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if not seq.block_table:    # warmup
-                continue
+            
+            if not seq.block_table: continue
+            
             for i in range(seq.num_cached_blocks, seq.num_blocks):
                 start = seq.block_table[i] * self.block_size
-                if i != seq.num_blocks - 1:
-                    end = start + self.block_size
-                else:
-                    end = start + seq.last_block_num_tokens 
+                end = start + self.block_size if i != seq.num_blocks - 1 else start + seq.last_block_num_tokens 
                 slot_mapping.extend(list(range(start, end)))
         
         for mm_input in mm_inputs:
@@ -270,30 +261,31 @@ class ModelRunner:
                 for mm_item in mm_input.mm_items:
                     mm_item.feature = getattr(mm_item, "feature", None).to(self.device, non_blocking=True)
         
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
             block_tables = self.prepare_block_tables(seqs)
         
+        # Compute mrope positions using CPU lists first
+        mrope_positions = self._compute_mrope_positions_prefill(mm_inputs, seq_lens, extend_seq_lens, prefix_lens)
+        
+        # Transfer generic data to GPU
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         
-        # what to add in context?
-        # prefix_lens, extend_seq_lens, mm_inputs
-        
-        seq_lens = torch.tensor(seq_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        prefix_lens = torch.tensor(prefix_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        extend_seq_lens = torch.tensor(extend_seq_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        mrope_positions = self._compute_mrope_positions_prefill(mm_inputs, seq_lens, extend_seq_lens, prefix_lens)
+        # Transfer metadata lists to GPU for context
+        seq_lens_gpu = torch.tensor(seq_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        prefix_lens_gpu = torch.tensor(prefix_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        extend_seq_lens_gpu = torch.tensor(extend_seq_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         
         set_context_field("mm_inputs", mm_inputs)
         set_context_field("mrope_positions", mrope_positions)
-        set_context_field("extend_prefix_lens", prefix_lens)
-        set_context_field("extend_seq_lens", extend_seq_lens)
-        set_context_field("seq_lens", seq_lens)
+        set_context_field("extend_prefix_lens", prefix_lens_gpu)
+        set_context_field("extend_seq_lens", extend_seq_lens_gpu)
+        set_context_field("seq_lens", seq_lens_gpu)
         
         return input_ids, positions
 
@@ -303,6 +295,7 @@ class ModelRunner:
         slot_mapping = []
         seq_lens = []
         mm_inputs = []
+        
         for seq in seqs:
             input_ids.append(seq.last_token)
             positions.append(len(seq))
@@ -310,14 +303,17 @@ class ModelRunner:
             mm_inputs.append(seq.mm_inputs)
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
             
+        # Compute mrope positions using CPU lists first
+        mrope_positions = self._compute_mrope_positions_decode(mm_inputs, seq_lens)
+
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        seq_lens = torch.tensor(seq_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        seq_lens_gpu = torch.tensor(seq_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        
         block_tables = self.prepare_block_tables(seqs)
         
-        mrope_positions = self._compute_mrope_positions_decode(mm_inputs, seq_lens)
-        set_context(False, slot_mapping=slot_mapping, context_lens=seq_lens, block_tables=block_tables)
+        set_context(False, slot_mapping=slot_mapping, context_lens=seq_lens_gpu, block_tables=block_tables)
         set_context_field("mrope_positions", mrope_positions)
         return input_ids, positions
 
