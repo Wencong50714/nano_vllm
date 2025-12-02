@@ -16,6 +16,9 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    use_hicache: bool = False
+    swap_space_factor: int = 4
+    num_cpu_kvcache_blocks: int = -1
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

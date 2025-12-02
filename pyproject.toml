@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "nano-vllm"
 version = "0.2.0"
-authors = [{ name = "Xingkai Yu" }]
+authors = [{ name = "Zonghao Chen" }]
 license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"
@@ -20,8 +20,20 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage="https://github.com/GeeeekExplorer/nano-vllm"
+Homepage="git@github.com:Wencong50714/nano_vllm.git"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["nanovllm*"]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-q"
+testpaths = ["tests"]
+python_files = "test_*.py"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
