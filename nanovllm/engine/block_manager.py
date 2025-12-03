@@ -16,6 +16,7 @@ if not logger.handlers:
     fh.setFormatter(formatter)
     logger.addHandler(fh)
 logger.setLevel(logging.DEBUG)
+logger.debug("\n" +  "="*50 + "\n")
 
 BlockHash = bytes
 
@@ -404,7 +405,6 @@ class HiCacheBlockManager:
 
         # Log load operation
         logger.debug(f"Load seq_id={getattr(seq, 'seq_id', None)} transfers={transfer_pairs}")
-
 
         return transfer_pairs
     

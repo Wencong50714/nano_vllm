@@ -22,6 +22,7 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.swapping_seq_id = -1
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -31,6 +32,7 @@ class ModelRunner:
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
+        self.offload_stream = torch.cuda.Stream()
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
@@ -115,7 +117,7 @@ class ModelRunner:
         if config.use_hicache:
             num_cpu_blocks = config.num_cpu_kvcache_blocks
             if num_cpu_blocks == -1:
-                num_cpu_blocks = config.num_kvcache_blocks * config.swap_space_factor
+                num_cpu_blocks = int(config.num_kvcache_blocks * config.swap_space_factor)
             config.num_cpu_kvcache_blocks = num_cpu_blocks
             self.cpu_kv_cache = torch.empty(
                 2, hf_config.num_hidden_layers, num_cpu_blocks, self.block_size, num_kv_heads, head_dim,
@@ -134,7 +136,7 @@ class ModelRunner:
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
 
-    def execute_offload(self, transfer_pairs: list[tuple[int, int]]):
+    def execute_offload(self, transfer_pairs: list[tuple[int, int]], seq_id: int):
         """Execute synchronous GPU->CPU KV cache transfer.
         
         Args:
@@ -142,20 +144,21 @@ class ModelRunner:
         """
         if self.cpu_kv_cache is None:
             return
-        
-        for gpu_bid, cpu_bid in transfer_pairs:
-            for layer_id in range(self.num_layers):
-                # Copy K cache from GPU to CPU (synchronous)
-                self.cpu_kv_cache[0, layer_id, cpu_bid].copy_(
-                    self.kv_cache[0, layer_id, gpu_bid]
-                )
-                # Copy V cache from GPU to CPU (synchronous)
-                self.cpu_kv_cache[1, layer_id, cpu_bid].copy_(
-                    self.kv_cache[1, layer_id, gpu_bid]
-                )
-        torch.cuda.synchronize()  # Ensure transfer completes
+
+        self.swapping_seq_id = seq_id
+        with torch.cuda.stream(self.offload_stream):
+            for gpu_bid, cpu_bid in transfer_pairs:
+                for layer_id in range(self.num_layers):
+                    # Copy K cache from GPU to CPU (asynchronous)
+                    self.cpu_kv_cache[0, layer_id, cpu_bid].copy_(
+                        self.kv_cache[0, layer_id, gpu_bid], non_blocking=True
+                    )
+                    # Copy V cache from GPU to CPU (asynchronous)
+                    self.cpu_kv_cache[1, layer_id, cpu_bid].copy_(
+                        self.kv_cache[1, layer_id, gpu_bid], non_blocking=True
+                    )
     
-    def execute_load(self, transfer_pairs: list[tuple[int, int]]):
+    def execute_load(self, transfer_pairs: list[tuple[int, int]], seq_id: int):
         """Execute synchronous CPU->GPU KV cache transfer.
         
         Args:
@@ -163,18 +166,19 @@ class ModelRunner:
         """
         if self.cpu_kv_cache is None:
             return
-        
-        for cpu_bid, gpu_bid in transfer_pairs:
-            for layer_id in range(self.num_layers):
-                # Copy K cache from CPU to GPU (synchronous)
-                self.kv_cache[0, layer_id, gpu_bid].copy_(
-                    self.cpu_kv_cache[0, layer_id, cpu_bid]
-                )
-                # Copy V cache from CPU to GPU (synchronous)
-                self.kv_cache[1, layer_id, gpu_bid].copy_(
-                    self.cpu_kv_cache[1, layer_id, cpu_bid]
-                )
-        torch.cuda.synchronize()  # Ensure transfer completes
+
+        self.swapping_seq_id = seq_id
+        with torch.cuda.stream(self.offload_stream):
+            for cpu_bid, gpu_bid in transfer_pairs:
+                for layer_id in range(self.num_layers):
+                    # Copy K cache from CPU to GPU (asynchronous)
+                    self.kv_cache[0, layer_id, gpu_bid].copy_(
+                        self.cpu_kv_cache[0, layer_id, cpu_bid], non_blocking=True
+                    )
+                    # Copy V cache from CPU to GPU (asynchronous)
+                    self.kv_cache[1, layer_id, gpu_bid].copy_(
+                        self.cpu_kv_cache[1, layer_id, cpu_bid], non_blocking=True
+                    )
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -268,6 +272,11 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        # Wait until swaping sequence in seqs
+        for seq in seqs:
+            if seq.seq_id == self.swapping_seq_id:
+                torch.cuda.current_stream().wait_stream(self.offload_stream)
+                self.swapping_seq_id = -1
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)

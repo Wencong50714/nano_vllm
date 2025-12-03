@@ -19,10 +19,10 @@ class Scheduler:
             # Calculate CPU blocks based on swap_space_factor
             num_cpu_blocks = config.num_cpu_kvcache_blocks
             if num_cpu_blocks == -1:
-                num_cpu_blocks = config.num_kvcache_blocks * config.swap_space_factor
+                num_cpu_blocks = int(config.num_kvcache_blocks * config.swap_space_factor)
             self.block_manager: Union[BlockManager, HiCacheBlockManager] = HiCacheBlockManager(
                 config.num_kvcache_blocks, 
-                num_cpu_blocks,
+                int(num_cpu_blocks),
                 config.kvcache_block_size
             )
         else:
@@ -99,7 +99,10 @@ class Scheduler:
                 # Get transfer pairs and execute data transfer
                 transfer_pairs = self.block_manager.load(seq)
                 if self.model_runner and transfer_pairs:
-                    self.model_runner.execute_load(transfer_pairs)
+                    if hasattr(self.model_runner, "call"):
+                        self.model_runner.call("execute_load", transfer_pairs, seq.seq_id)
+                    else:
+                        self.model_runner.execute_load(transfer_pairs)
                 self.swapped.popleft()
                 self.running.append(seq)
             else:
@@ -114,7 +117,10 @@ class Scheduler:
             # Get transfer pairs and execute data transfer
             transfer_pairs = self.block_manager.offload(seq)
             if self.model_runner and transfer_pairs:
-                self.model_runner.execute_offload(transfer_pairs)
+                if hasattr(self.model_runner, "call"):
+                    self.model_runner.call("execute_offload", transfer_pairs, seq.seq_id)
+                else:
+                    self.model_runner.execute_offload(transfer_pairs)
             self.swapped.append(seq)
             return True
         return False
