@@ -28,6 +28,11 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        
+        # Timing for benchmarking
+        self.start_time = None  # Set when first scheduled
+        self.first_token_time = None  # Set when first token is generated
+        self.finish_time = None  # Set when sequence finishes
 
     def __len__(self):
         return self.num_tokens

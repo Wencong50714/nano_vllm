@@ -8,11 +8,12 @@ from nanovllm.engine.block_manager import BlockManager, HiCacheBlockManager
 
 class Scheduler:
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, model_runner=None):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.use_hicache = config.use_hicache
+        self.model_runner = model_runner  # Store reference for data transfer
         
         if self.use_hicache:
             # Calculate CPU blocks based on swap_space_factor
@@ -95,7 +96,10 @@ class Scheduler:
         while self.swapped:
             seq = self.swapped[0]
             if self.block_manager.can_load(seq):
-                self.block_manager.load(seq)
+                # Get transfer pairs and execute data transfer
+                transfer_pairs = self.block_manager.load(seq)
+                if self.model_runner and transfer_pairs:
+                    self.model_runner.execute_load(transfer_pairs)
                 self.swapped.popleft()
                 self.running.append(seq)
             else:
@@ -107,7 +111,10 @@ class Scheduler:
             return False
         
         if self.block_manager.can_offload(seq):
-            self.block_manager.offload(seq)
+            # Get transfer pairs and execute data transfer
+            transfer_pairs = self.block_manager.offload(seq)
+            if self.model_runner and transfer_pairs:
+                self.model_runner.execute_offload(transfer_pairs)
             self.swapped.append(seq)
             return True
         return False

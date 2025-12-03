@@ -110,12 +110,71 @@ class ModelRunner:
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        
+        # Allocate CPU KV cache for HiCache
+        if config.use_hicache:
+            num_cpu_blocks = config.num_cpu_kvcache_blocks
+            if num_cpu_blocks == -1:
+                num_cpu_blocks = config.num_kvcache_blocks * config.swap_space_factor
+            config.num_cpu_kvcache_blocks = num_cpu_blocks
+            self.cpu_kv_cache = torch.empty(
+                2, hf_config.num_hidden_layers, num_cpu_blocks, self.block_size, num_kv_heads, head_dim,
+                dtype=hf_config.torch_dtype,
+                device='cpu',
+                pin_memory=True  # Use pinned memory for faster CPU-GPU transfer
+            )
+            self.num_layers = hf_config.num_hidden_layers
+        else:
+            self.cpu_kv_cache = None
+        
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
+
+    def execute_offload(self, transfer_pairs: list[tuple[int, int]]):
+        """Execute synchronous GPU->CPU KV cache transfer.
+        
+        Args:
+            transfer_pairs: List of (gpu_block_id, cpu_block_id) pairs.
+        """
+        if self.cpu_kv_cache is None:
+            return
+        
+        for gpu_bid, cpu_bid in transfer_pairs:
+            for layer_id in range(self.num_layers):
+                # Copy K cache from GPU to CPU (synchronous)
+                self.cpu_kv_cache[0, layer_id, cpu_bid].copy_(
+                    self.kv_cache[0, layer_id, gpu_bid]
+                )
+                # Copy V cache from GPU to CPU (synchronous)
+                self.cpu_kv_cache[1, layer_id, cpu_bid].copy_(
+                    self.kv_cache[1, layer_id, gpu_bid]
+                )
+        torch.cuda.synchronize()  # Ensure transfer completes
+    
+    def execute_load(self, transfer_pairs: list[tuple[int, int]]):
+        """Execute synchronous CPU->GPU KV cache transfer.
+        
+        Args:
+            transfer_pairs: List of (cpu_block_id, gpu_block_id) pairs.
+        """
+        if self.cpu_kv_cache is None:
+            return
+        
+        for cpu_bid, gpu_bid in transfer_pairs:
+            for layer_id in range(self.num_layers):
+                # Copy K cache from CPU to GPU (synchronous)
+                self.kv_cache[0, layer_id, gpu_bid].copy_(
+                    self.cpu_kv_cache[0, layer_id, cpu_bid]
+                )
+                # Copy V cache from CPU to GPU (synchronous)
+                self.kv_cache[1, layer_id, gpu_bid].copy_(
+                    self.cpu_kv_cache[1, layer_id, cpu_bid]
+                )
+        torch.cuda.synchronize()  # Ensure transfer completes
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -153,6 +212,7 @@ class ModelRunner:
                 slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
+        # TODO: slot_mapping logic
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -177,6 +237,7 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
+        # TODO: maybe in here add sync function?
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
